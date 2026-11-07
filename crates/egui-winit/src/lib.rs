@@ -2959,15 +2959,7 @@ impl State {
                 touch.location.x as f32 / pixels_per_point,
                 touch.location.y as f32 / pixels_per_point,
             ),
-            force: match touch.force {
-                Some(winit::event::Force::Normalized(force)) => Some(force as f32),
-                Some(winit::event::Force::Calibrated {
-                    force,
-                    max_possible_force,
-                    ..
-                }) => Some((force / max_possible_force) as f32),
-                None => None,
-            },
+            force: touch_force(touch.force),
         });
         // If we're not yet translating a touch or we're translating this very
         // touch …
@@ -3000,6 +2992,12 @@ impl State {
                 }
                 winit::event::TouchPhase::Cancelled => {
                     self.pointer_touch_id = None;
+                    // A canceled contact (a pen leaving proximity, a removed tablet tool) still
+                    // has to release the emulated button, or the app keeps the stroke open.
+                    self.on_mouse_button_input(
+                        winit::event::ElementState::Released,
+                        winit::event::MouseButton::Left,
+                    );
                     self.pointer_pos_in_points = None;
                     self.egui_input.events.push(egui::Event::PointerGone);
                 }
@@ -3632,6 +3630,21 @@ fn to_egui_touch_phase(phase: winit::event::TouchPhase) -> egui::TouchPhase {
         winit::event::TouchPhase::Moved => egui::TouchPhase::Move,
         winit::event::TouchPhase::Ended => egui::TouchPhase::End,
         winit::event::TouchPhase::Cancelled => egui::TouchPhase::Cancel,
+    }
+}
+
+/// A windowing touch sample's force as egui's 0..=1 value. `None` and non-finite values stay
+/// `None`; a pen's contact pressure passes through unchanged.
+fn touch_force(force: Option<winit::event::Force>) -> Option<f32> {
+    match force {
+        Some(winit::event::Force::Normalized(force)) => force.is_finite().then_some(force as f32),
+        Some(winit::event::Force::Calibrated {
+            force,
+            max_possible_force,
+            ..
+        }) => (force.is_finite() && max_possible_force.is_finite() && max_possible_force > 0.0)
+            .then_some((force / max_possible_force) as f32),
+        None => None,
     }
 }
 
@@ -5373,5 +5386,45 @@ mod tests {
         let enter_vk = windows_virtual_letter(Some(VK_RETURN));
         assert_eq!(letter_key(enter, enter_vk, false), Some(Key::Enter));
         assert_eq!(letter_key(enter, None, true), Some(Key::Enter));
+    }
+}
+
+#[cfg(test)]
+mod pen_pressure_tests {
+    use super::touch_force;
+
+    #[test]
+    fn normalized_pen_force_passes_through() {
+        assert_eq!(
+            touch_force(Some(winit::event::Force::Normalized(0.2))),
+            Some(0.2)
+        );
+        assert_eq!(touch_force(None), None);
+    }
+
+    #[test]
+    fn calibrated_force_is_normalized() {
+        let force = winit::event::Force::Calibrated {
+            force: 2.0,
+            max_possible_force: 8.0,
+            altitude_angle: None,
+        };
+        assert_eq!(touch_force(Some(force)), Some(0.25));
+    }
+
+    #[test]
+    fn hostile_force_is_not_forwarded() {
+        assert_eq!(
+            touch_force(Some(winit::event::Force::Normalized(f64::NAN))),
+            None
+        );
+        assert_eq!(
+            touch_force(Some(winit::event::Force::Calibrated {
+                force: 1.0,
+                max_possible_force: 0.0,
+                altitude_angle: None,
+            })),
+            None
+        );
     }
 }
